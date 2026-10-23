@@ -8,6 +8,6 @@ fn main() {
 
     let list = history.get_items();
     for i in list.iter() {
-        println!("{:#?}, {:#?}", i.content, i.timestamp);
+        println!("{:#?}", i.content);
     }
 }
