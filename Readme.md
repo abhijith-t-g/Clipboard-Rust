@@ -1,0 +1,1 @@
+A clipboard App for Linux
