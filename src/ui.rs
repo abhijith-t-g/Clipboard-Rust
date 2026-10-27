@@ -123,9 +123,14 @@ thread_local! {
     static LIST_BOX_REF: RefCell<Option<ListBox>> = const { RefCell::new(None) };
     static COUNT_BADGE_REF: RefCell<Option<Button>> = const { RefCell::new(None) };
     static APP_HOLD_GUARD: RefCell<Option<gio::ApplicationHoldGuard>> = const { RefCell::new(None) };
+    static TARGET_WINDOW_ID: RefCell<Option<u32>> = const { RefCell::new(None) };
 }
 
 pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>>) {
+    // Save target window before our window takes focus
+    let prev_active = crate::x11_helper::get_active_window();
+    TARGET_WINDOW_ID.with(|t| *t.borrow_mut() = prev_active);
+
     // If window already exists, refresh it and bring to front
     if let Some(window) = OVERLAY_WINDOW.with(|w| w.borrow().clone()) {
         if let Some(list_box) = LIST_BOX_REF.with(|l| l.borrow().clone()) {
@@ -136,7 +141,11 @@ pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>
             search.grab_focus();
         }
         update_badge(&history.lock().unwrap());
+        window.set_visible(true);
         window.present();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(30), || {
+            crate::x11_helper::position_window_at_cursor(330, 420);
+        });
         return;
     }
 
@@ -295,6 +304,8 @@ pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>
             }
             history_activate.lock().unwrap().add(content);
             window_activate.set_visible(false);
+            let target_win = TARGET_WINDOW_ID.with(|t| *t.borrow());
+            crate::x11_helper::paste_into_window(target_win);
         }
     };
 
@@ -348,7 +359,11 @@ pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>
     COUNT_BADGE_REF.with(|b| *b.borrow_mut() = Some(clear_btn));
 
     search_entry.grab_focus();
+    window.set_visible(true);
     window.present();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(50), || {
+        crate::x11_helper::position_window_at_cursor(330, 420);
+    });
 }
 
 fn update_badge(history: &ClipboardHistory) {

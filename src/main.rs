@@ -1,5 +1,6 @@
 mod history;
 mod ui;
+mod x11_helper;
 
 use std::sync::{Arc, Mutex};
 use gtk4::prelude::*;
