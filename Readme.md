@@ -38,12 +38,16 @@ A lightweight, privacy-first, low-RAM clipboard manager designed for Linux Mint 
 
 - [x] **Phase 1: In-Memory Storage Engine**
   - [x] Pure Rust data structures (`VecDeque`, custom types)
-  - [ ] Capacity bounding & automatic eviction
-  - [ ] Deduplication and item promotion
-  - [ ] Unit tests for history operations
+  - [x] Capacity bounding & automatic eviction
+  - [x] Deduplication and item promotion
+  - [x] Unit tests for history operations
 - [ ] **Phase 2: Linux Clipboard Polling / Listener Daemon**
 - [ ] **Phase 3: IPC & Global Hotkey Handling**
-- [ ] **Phase 4: Lightweight GTK4 UI Overlay**
+- [x] **Phase 4: Lightweight GTK4 UI Overlay**
+  - [x] Modern Catppuccin / Tokyo Night dark CSS styling
+  - [x] Real-time search & fuzzy filtering
+  - [x] Keyboard navigation (`Enter`, `Del`, `Esc`)
+  - [x] System clipboard writing & auto-dismissal
 
 ---
 
