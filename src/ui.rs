@@ -2,126 +2,150 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use gtk4::gdk;
+use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, CssProvider, EventControllerKey,
+    Application, ApplicationWindow, Box as GtkBox, Button, CssProvider, EventControllerKey,
     Label, ListBox, ListBoxRow, Orientation, PolicyType, ScrolledWindow, SearchEntry,
 };
 
 use crate::history::ClipboardHistory;
 
+// Windows 11 Fluent Dark styling
 const CSS: &str = r#"
 window {
     background-color: transparent;
 }
 
-.main-container {
-    background-color: #1e1e2e;
-    border-radius: 16px;
-    border: 1px solid #313244;
-    padding: 14px;
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+.win-container {
+    background-color: #202020;
+    border-radius: 12px;
+    border: 1px solid #383838;
+    padding: 10px 12px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
 }
 
-.header-title {
-    color: #cdd6f4;
-    font-size: 15px;
-    font-weight: 700;
-    margin-bottom: 4px;
+.win-header {
+    margin-bottom: 6px;
 }
 
-.header-badge {
-    background-color: #313244;
-    color: #89b4fa;
-    font-size: 11px;
+.win-title {
+    color: #ffffff;
+    font-size: 13px;
     font-weight: 600;
+}
+
+.clear-btn {
+    background-color: #2b2b2b;
+    color: #a0a0a0;
+    font-size: 11px;
+    font-weight: 500;
     border-radius: 6px;
     padding: 2px 8px;
+    border: 1px solid #383838;
+    min-height: 22px;
+}
+
+.clear-btn:hover {
+    background-color: #383838;
+    color: #ffffff;
 }
 
 .search-input {
-    background-color: #181825;
-    color: #cdd6f4;
-    border-radius: 10px;
-    border: 1px solid #313244;
-    padding: 8px 12px;
-    font-size: 13px;
-    margin-top: 6px;
+    background-color: #2b2b2b;
+    color: #ffffff;
+    border-radius: 6px;
+    border: 1px solid #383838;
+    padding: 4px 8px;
+    font-size: 12px;
     margin-bottom: 8px;
+    min-height: 28px;
 }
 
 .search-input:focus-within {
-    border-color: #89b4fa;
-    box-shadow: 0 0 0 2px rgba(137, 180, 250, 0.25);
+    border-color: #60cdff;
+    box-shadow: 0 0 0 1px #60cdff;
 }
 
 .history-list {
     background-color: transparent;
-    border-radius: 10px;
 }
 
 .history-row {
-    background-color: #181825;
-    border-radius: 8px;
-    margin-bottom: 6px;
-    padding: 8px 12px;
+    background-color: #2b2b2b;
+    border-radius: 6px;
+    margin-bottom: 5px;
+    padding: 7px 10px;
     border: 1px solid transparent;
-    transition: all 150ms ease-in-out;
+    transition: background-color 100ms ease;
 }
 
 .history-row:hover {
-    background-color: #24273a;
-    border-color: #363a4f;
+    background-color: #333333;
+    border-color: #404040;
 }
 
 .history-row:selected {
-    background-color: #313244;
-    border-left: 3px solid #89b4fa;
-}
-
-.item-index {
-    color: #89b4fa;
-    font-size: 11px;
-    font-weight: 700;
-    margin-right: 6px;
+    background-color: #383838;
+    border-left: 3px solid #60cdff;
 }
 
 .item-content {
-    color: #cdd6f4;
-    font-size: 13px;
-    font-family: monospace;
+    color: #ffffff;
+    font-size: 12px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.3;
 }
 
 .item-meta {
-    color: #6c7086;
-    font-size: 11px;
+    color: #888888;
+    font-size: 10px;
     margin-top: 3px;
 }
 
 .footer-bar {
-    border-top: 1px solid #313244;
-    padding-top: 8px;
-    margin-top: 6px;
+    border-top: 1px solid #303030;
+    padding-top: 6px;
+    margin-top: 4px;
 }
 
 .footer-hint {
-    color: #6c7086;
-    font-size: 11px;
-}
-
-.footer-key {
-    background-color: #313244;
-    color: #a6adc8;
-    border-radius: 4px;
-    padding: 1px 5px;
+    color: #777777;
     font-size: 10px;
-    font-weight: 600;
 }
 "#;
 
-pub fn build_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>>) {
-    // 1. Install modern dark theme CSS
+// State holding our single overlay instance
+thread_local! {
+    static OVERLAY_WINDOW: RefCell<Option<ApplicationWindow>> = const { RefCell::new(None) };
+    static SEARCH_ENTRY_REF: RefCell<Option<SearchEntry>> = const { RefCell::new(None) };
+    static LIST_BOX_REF: RefCell<Option<ListBox>> = const { RefCell::new(None) };
+    static COUNT_BADGE_REF: RefCell<Option<Button>> = const { RefCell::new(None) };
+    static APP_HOLD_GUARD: RefCell<Option<gio::ApplicationHoldGuard>> = const { RefCell::new(None) };
+}
+
+pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>>) {
+    // If window already exists, refresh it and bring to front
+    if let Some(window) = OVERLAY_WINDOW.with(|w| w.borrow().clone()) {
+        if let Some(list_box) = LIST_BOX_REF.with(|l| l.borrow().clone()) {
+            populate_list(&list_box, &history.lock().unwrap());
+        }
+        if let Some(search) = SEARCH_ENTRY_REF.with(|s| s.borrow().clone()) {
+            search.set_text("");
+            search.grab_focus();
+        }
+        update_badge(&history.lock().unwrap());
+        window.present();
+        return;
+    }
+
+    // 1. Hold application guard so it runs as a background daemon even when window is hidden
+    APP_HOLD_GUARD.with(|guard| {
+        *guard.borrow_mut() = Some(app.hold());
+    });
+
+    // 2. Install Windows 11 Dark CSS
     if let Some(display) = gdk::Display::default() {
         let provider = CssProvider::new();
         provider.load_from_data(CSS);
@@ -130,46 +154,66 @@ pub fn build_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>>) {
             &provider,
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+
+        // 3. Setup Clipboard Listener Daemon (Phase 2):
+        // Automatically capture whatever the user copies anywhere on system
+        let clipboard = display.clipboard();
+        let history_listener = history.clone();
+        clipboard.connect_changed(move |clip| {
+            let hist = history_listener.clone();
+            clip.read_text_async(None::<&gio::Cancellable>, move |res| {
+                if let Ok(Some(text)) = res {
+                    let text = text.to_string();
+                    if hist.lock().unwrap().add(text) {
+                        // Refresh UI if visible
+                        if let Some(list_box) = LIST_BOX_REF.with(|l| l.borrow().clone()) {
+                            populate_list(&list_box, &hist.lock().unwrap());
+                            update_badge(&hist.lock().unwrap());
+                        }
+                    }
+                }
+            });
+        });
     }
 
-    // Main layout container with styling
+    // Main layout
     let vbox = GtkBox::new(Orientation::Vertical, 0);
-    vbox.add_css_class("main-container");
+    vbox.add_css_class("win-container");
 
-    // Header bar (Title + Item Count Badge)
-    let header_box = GtkBox::new(Orientation::Horizontal, 8);
+    // Header bar (Title + "Clear all" button)
+    let header_box = GtkBox::new(Orientation::Horizontal, 6);
+    header_box.add_css_class("win-header");
+
     let title_label = Label::builder()
-        .label("Clipboard History")
-        .css_classes(["header-title"])
+        .label("Clipboard")
+        .css_classes(["win-title"])
         .hexpand(true)
         .xalign(0.0)
         .build();
     header_box.append(&title_label);
 
-    let count_badge = Label::builder()
-        .label(&format!("{} items", history.lock().unwrap().len()))
-        .css_classes(["header-badge"])
+    let clear_btn = Button::builder()
+        .label(&format!("Clear all ({})", history.lock().unwrap().len()))
+        .css_classes(["clear-btn"])
         .build();
-    header_box.append(&count_badge);
+    header_box.append(&clear_btn);
     vbox.append(&header_box);
 
-    // Search bar
+    // Search input
     let search_entry = SearchEntry::builder()
-        .placeholder_text("Type to search history...")
+        .placeholder_text("Search...")
         .css_classes(["search-input"])
         .build();
     vbox.append(&search_entry);
 
-    // ListBox for items
+    // Scrollable list
     let list_box = ListBox::builder()
         .selection_mode(gtk4::SelectionMode::Single)
         .css_classes(["history-list"])
         .build();
 
-    // Populate rows from history
     populate_list(&list_box, &history.lock().unwrap());
 
-    // Wrap list inside a scrollable view
     let scrolled_window = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
@@ -178,16 +222,11 @@ pub fn build_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>>) {
         .build();
     vbox.append(&scrolled_window);
 
-    // Footer with key hints
-    let footer_box = GtkBox::new(Orientation::Horizontal, 8);
+    // Footer with clean hint text
+    let footer_box = GtkBox::new(Orientation::Horizontal, 6);
     footer_box.add_css_class("footer-bar");
     let footer_hint = Label::builder()
-        .label(
-            "<span class='footer-key'>Enter</span> Copy &amp; Close   \
-             <span class='footer-key'>Del</span> Delete   \
-             <span class='footer-key'>Esc</span> Dismiss",
-        )
-        .use_markup(true)
+        .label("Enter to paste  •  Del to remove  •  Esc to close")
         .css_classes(["footer-hint"])
         .xalign(0.0)
         .hexpand(true)
@@ -195,17 +234,36 @@ pub fn build_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>>) {
     footer_box.append(&footer_hint);
     vbox.append(&footer_box);
 
-    // Window Setup
+    // Compact Windows 11 dimensions (330px x 420px)
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Clipboard")
-        .default_width(450)
-        .default_height(500)
+        .default_width(330)
+        .default_height(420)
         .decorated(false)
         .child(&vbox)
         .build();
 
-    // Dynamic Filter: filters items as the user types
+    // Auto-dismiss when user clicks outside (Focus-out / Blur)
+    let window_focus = window.clone();
+    window.connect_is_active_notify(move |win| {
+        if !win.is_active() {
+            window_focus.set_visible(false);
+        }
+    });
+
+    // Clear all action
+    let history_clear = history.clone();
+    let list_box_clear = list_box.clone();
+    let clear_btn_ref = clear_btn.clone();
+    clear_btn.connect_clicked(move |_| {
+        let mut hist = history_clear.lock().unwrap();
+        hist.clear();
+        clear_btn_ref.set_label("Clear all (0)");
+        populate_list(&list_box_clear, &hist);
+    });
+
+    // Search filter
     let search_text = Rc::new(RefCell::new(String::new()));
     let search_text_clone = search_text.clone();
 
@@ -214,8 +272,6 @@ pub fn build_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>>) {
         if query.is_empty() {
             return true;
         }
-
-        // Check the text stored on the row
         if let Some(content) = get_row_content(row) {
             content.to_lowercase().contains(&query)
         } else {
@@ -223,26 +279,22 @@ pub fn build_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>>) {
         }
     });
 
-    let list_box_ref = list_box.clone();
+    let list_box_filter = list_box.clone();
     search_entry.connect_search_changed(move |entry| {
         *search_text.borrow_mut() = entry.text().to_string();
-        list_box_ref.invalidate_filter();
+        list_box_filter.invalidate_filter();
     });
 
-    // Action: Copy selected item & close window
-    let window_ref = window.clone();
-    let history_for_activate = history.clone();
-    let count_badge_ref = count_badge.clone();
-
+    // Activate item: Copy & Hide
+    let window_activate = window.clone();
+    let history_activate = history.clone();
     let activate_selected = move |row: &ListBoxRow| {
         if let Some(content) = get_row_content(row) {
-            // Write to system clipboard
             if let Some(display) = gdk::Display::default() {
                 display.clipboard().set_text(&content);
             }
-            // LRU Promote inside history as well
-            history_for_activate.lock().unwrap().add(content);
-            window_ref.close();
+            history_activate.lock().unwrap().add(content);
+            window_activate.set_visible(false);
         }
     };
 
@@ -251,32 +303,32 @@ pub fn build_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>>) {
         activate_clone(row);
     });
 
-    // Keyboard Controller: Escape (Close), Delete (Remove item), Enter (Select)
+    // Keyboard shortcuts
     let key_controller = EventControllerKey::new();
-    let window_for_keys = window.clone();
-    let history_for_keys = history.clone();
-    let list_box_for_keys = list_box.clone();
+    let window_keys = window.clone();
+    let history_keys = history.clone();
+    let list_box_keys = list_box.clone();
 
     key_controller.connect_key_pressed(move |_, key, _, _| {
         match key {
             gdk::Key::Escape => {
-                window_for_keys.close();
+                window_keys.set_visible(false);
                 glib::Propagation::Stop
             }
             gdk::Key::Delete => {
-                if let Some(row) = list_box_for_keys.selected_row() {
+                if let Some(row) = list_box_keys.selected_row() {
                     let idx = row.index();
                     if idx >= 0 {
-                        let mut hist = history_for_keys.lock().unwrap();
+                        let mut hist = history_keys.lock().unwrap();
                         hist.remove_at(idx as usize);
-                        count_badge_ref.set_label(&format!("{} items", hist.len()));
-                        populate_list(&list_box_for_keys, &hist);
+                        update_badge(&hist);
+                        populate_list(&list_box_keys, &hist);
                     }
                 }
                 glib::Propagation::Stop
             }
             gdk::Key::Return | gdk::Key::KP_Enter => {
-                if let Some(row) = list_box_for_keys.selected_row() {
+                if let Some(row) = list_box_keys.selected_row() {
                     activate_selected(&row);
                     glib::Propagation::Stop
                 } else {
@@ -289,39 +341,37 @@ pub fn build_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>>) {
 
     window.add_controller(key_controller);
 
-    // Auto-focus search entry
-    search_entry.grab_focus();
+    // Save references to state
+    OVERLAY_WINDOW.with(|w| *w.borrow_mut() = Some(window.clone()));
+    SEARCH_ENTRY_REF.with(|s| *s.borrow_mut() = Some(search_entry.clone()));
+    LIST_BOX_REF.with(|l| *l.borrow_mut() = Some(list_box));
+    COUNT_BADGE_REF.with(|b| *b.borrow_mut() = Some(clear_btn));
 
+    search_entry.grab_focus();
     window.present();
 }
 
+fn update_badge(history: &ClipboardHistory) {
+    if let Some(btn) = COUNT_BADGE_REF.with(|b| b.borrow().clone()) {
+        btn.set_label(&format!("Clear all ({})", history.len()));
+    }
+}
+
 fn populate_list(list_box: &ListBox, history: &ClipboardHistory) {
-    // Clear existing rows
     while let Some(child) = list_box.first_child() {
         list_box.remove(&child);
     }
 
-    for (i, item) in history.get_items().iter().enumerate() {
+    for item in history.get_items().iter() {
         let row = ListBoxRow::builder()
             .css_classes(["history-row"])
             .build();
 
         let row_box = GtkBox::new(Orientation::Vertical, 2);
 
-        // Top line: Index + Content snippet
-        let top_box = GtkBox::new(Orientation::Horizontal, 6);
-        let idx_label = Label::builder()
-            .label(&format!("{}.", i + 1))
-            .css_classes(["item-index"])
-            .build();
-        top_box.append(&idx_label);
-
-        // Truncate long preview strings for clean aesthetics
-        let preview = if item.content.len() > 60 {
-            format!("{}...", &item.content[..60].replace('\n', " "))
-        } else {
-            item.content.replace('\n', " ")
-        };
+        // Preview snippet (max 3 lines)
+        let lines: Vec<&str> = item.content.lines().take(3).collect();
+        let preview = lines.join("\n");
 
         let content_label = Label::builder()
             .label(&preview)
@@ -329,11 +379,13 @@ fn populate_list(list_box: &ListBox, history: &ClipboardHistory) {
             .xalign(0.0)
             .hexpand(true)
             .ellipsize(gtk4::pango::EllipsizeMode::End)
+            .max_width_chars(35)
+            .wrap(true)
+            .lines(3)
             .build();
-        top_box.append(&content_label);
-        row_box.append(&top_box);
+        row_box.append(&content_label);
 
-        // Bottom line: Relative timestamp + character count
+        // Metadata: relative time and character length
         let meta_text = format!("{} • {} chars", item.relative_time(), item.content.len());
         let meta_label = Label::builder()
             .label(&meta_text)
@@ -342,7 +394,6 @@ fn populate_list(list_box: &ListBox, history: &ClipboardHistory) {
             .build();
         row_box.append(&meta_label);
 
-        // Store original content on the widget for filtering and selection
         unsafe {
             row.set_data("clipboard-content", item.content.clone());
         }
@@ -351,7 +402,6 @@ fn populate_list(list_box: &ListBox, history: &ClipboardHistory) {
         list_box.append(&row);
     }
 
-    // Select the first item by default if available
     if let Some(first_row) = list_box.row_at_index(0) {
         list_box.select_row(Some(&first_row));
     }

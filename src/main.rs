@@ -29,7 +29,7 @@ fn main() {
 
     let history_clone = history.clone();
     app.connect_activate(move |app| {
-        ui::build_ui(app, history_clone.clone());
+        ui::show_or_create_ui(app, history_clone.clone());
     });
 
     // 3. Start event loop
