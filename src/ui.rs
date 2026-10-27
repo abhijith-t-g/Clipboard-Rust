@@ -114,6 +114,28 @@ window {
     color: #777777;
     font-size: 10px;
 }
+
+.empty-row {
+    background-color: transparent;
+    border: none;
+}
+
+.empty-smile {
+    color: #60cdff;
+    font-size: 30px;
+    margin-bottom: 4px;
+}
+
+.empty-title {
+    color: #ffffff;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.empty-sub {
+    color: #888888;
+    font-size: 11px;
+}
 "#;
 
 // State holding our single overlay instance
@@ -144,7 +166,7 @@ pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>
         }
         update_badge(&history.lock().unwrap());
 
-        // Reposition window at cursor before presenting
+        // Position window at cursor coordinates BEFORE presenting
         let xid = WINDOW_XID.with(|x| *x.borrow());
         if let Some(xid) = xid {
             crate::x11_helper::position_window_by_id(xid, 330, 420);
@@ -154,13 +176,6 @@ pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>
 
         window.set_visible(true);
         window.present();
-
-        // Enforce position once more right after map
-        glib::timeout_add_local_once(std::time::Duration::from_millis(20), move || {
-            if let Some(xid) = xid {
-                crate::x11_helper::position_window_by_id(xid, 330, 420);
-            }
-        });
         return;
     }
 
@@ -278,6 +293,9 @@ pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>
     let window_focus = window.clone();
     window.connect_is_active_notify(move |win| {
         if !win.is_active() {
+            if let Some(xid) = WINDOW_XID.with(|x| *x.borrow()) {
+                crate::x11_helper::move_offscreen(xid);
+            }
             window_focus.set_visible(false);
         }
     });
@@ -325,6 +343,9 @@ pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>
                 display.primary_clipboard().set_text(&content);
             }
             history_activate.lock().unwrap().add(content);
+            if let Some(xid) = WINDOW_XID.with(|x| *x.borrow()) {
+                crate::x11_helper::move_offscreen(xid);
+            }
             window_activate.set_visible(false);
             let target_win = TARGET_WINDOW_ID.with(|t| *t.borrow());
             crate::x11_helper::paste_into_window(target_win);
@@ -345,6 +366,9 @@ pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>
     key_controller.connect_key_pressed(move |_, key, _, _| {
         match key {
             gdk::Key::Escape => {
+                if let Some(xid) = WINDOW_XID.with(|x| *x.borrow()) {
+                    crate::x11_helper::move_offscreen(xid);
+                }
                 window_keys.set_visible(false);
                 glib::Propagation::Stop
             }
@@ -382,7 +406,7 @@ pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>
 
     search_entry.grab_focus();
 
-    // Position window at cursor coordinates
+    // Position window at cursor coordinates BEFORE presenting
     if let Some(xid) = xid {
         crate::x11_helper::position_window_by_id(xid, 330, 420);
     } else {
@@ -391,13 +415,6 @@ pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>
 
     window.set_visible(true);
     window.present();
-
-    // Final position check right after map
-    glib::timeout_add_local_once(std::time::Duration::from_millis(20), move || {
-        if let Some(xid) = xid {
-            crate::x11_helper::position_window_by_id(xid, 330, 420);
-        }
-    });
 }
 
 fn update_badge(history: &ClipboardHistory) {
@@ -409,6 +426,43 @@ fn update_badge(history: &ClipboardHistory) {
 fn populate_list(list_box: &ListBox, history: &ClipboardHistory) {
     while let Some(child) = list_box.first_child() {
         list_box.remove(&child);
+    }
+
+    if history.is_empty() {
+        let empty_row = ListBoxRow::builder()
+            .activatable(false)
+            .selectable(false)
+            .css_classes(["empty-row"])
+            .build();
+
+        let empty_box = GtkBox::new(Orientation::Vertical, 6);
+        empty_box.set_margin_top(45);
+        empty_box.set_margin_bottom(45);
+
+        let smile_label = Label::builder()
+            .label("(｡◕‿◕｡)")
+            .css_classes(["empty-smile"])
+            .halign(gtk4::Align::Center)
+            .build();
+        empty_box.append(&smile_label);
+
+        let msg_label = Label::builder()
+            .label("Nothing copied yet")
+            .css_classes(["empty-title"])
+            .halign(gtk4::Align::Center)
+            .build();
+        empty_box.append(&msg_label);
+
+        let sub_label = Label::builder()
+            .label("Copy text anywhere to see it here")
+            .css_classes(["empty-sub"])
+            .halign(gtk4::Align::Center)
+            .build();
+        empty_box.append(&sub_label);
+
+        empty_row.set_child(Some(&empty_box));
+        list_box.append(&empty_row);
+        return;
     }
 
     for item in history.get_items().iter() {

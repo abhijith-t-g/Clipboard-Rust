@@ -1,6 +1,7 @@
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
 use x11rb::protocol::xtest::ConnectionExt as _;
+use x11rb::wrapper::ConnectionExt as _;
 
 /// Queries current mouse root coordinates and screen dimensions
 pub fn get_mouse_and_screen() -> Option<(i32, i32, i32, i32)> {
@@ -67,9 +68,94 @@ pub fn compute_cursor_position(win_width: i32, win_height: i32) -> Option<(i32, 
     Some((target_x, target_y))
 }
 
+/// Sets ICCCM WM_NORMAL_HINTS with USPosition flag so the window manager
+/// places the window at (x, y) immediately on map, without defaulting to (0, 0)
+pub fn set_wm_normal_hints_position(xid: u32, x: i32, y: i32, w: i32, h: i32) {
+    let Ok((conn, _)) = x11rb::connect(None) else {
+        return;
+    };
+    // USPosition (1 << 0) | PPosition (1 << 2) | USSize (1 << 1) | PSize (1 << 3)
+    let flags: u32 = (1 << 0) | (1 << 2) | (1 << 1) | (1 << 3);
+    let hints: [u32; 18] = [
+        flags,
+        x as u32,
+        y as u32,
+        w as u32,
+        h as u32,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    let _ = conn.change_property32(
+        x11rb::protocol::xproto::PropMode::REPLACE,
+        xid,
+        AtomEnum::WM_NORMAL_HINTS,
+        AtomEnum::WM_SIZE_HINTS,
+        &hints,
+    );
+    let _ = conn.flush();
+}
+
+/// Moves window offscreen when hidden so it never flashes at (0, 0) when re-mapped
+pub fn move_offscreen(xid: u32) {
+    let hex_id = format!("0x{:08x}", xid);
+    let _ = std::process::Command::new("wmctrl")
+        .args([
+            "-i",
+            "-r",
+            &hex_id,
+            "-e",
+            "0,-3000,-3000,330,420",
+        ])
+        .status();
+}
+
 /// Positions window directly by XID before presenting
 pub fn position_window_by_id(xid: u32, win_width: i32, win_height: i32) {
     if let Some((target_x, target_y)) = compute_cursor_position(win_width, win_height) {
+        set_wm_normal_hints_position(xid, target_x, target_y, win_width, win_height);
+
+        // Direct in-process EWMH client message to window manager
+        if let Ok((conn, screen_num)) = x11rb::connect(None) {
+            let screen = &conn.setup().roots[screen_num];
+            // ConfigureWindow
+            let aux = x11rb::protocol::xproto::ConfigureWindowAux::new()
+                .x(target_x)
+                .y(target_y)
+                .width(win_width as u32)
+                .height(win_height as u32);
+            let _ = conn.configure_window(xid, &aux);
+
+            // _NET_MOVERESIZE_WINDOW (Gravity: 1 NorthWest, Flags: 0x0f << 8)
+            if let Ok(atom_reply) = conn.intern_atom(false, b"_NET_MOVERESIZE_WINDOW") {
+                if let Ok(atom) = atom_reply.reply() {
+                    let flags: u32 = 1 | (0x0f << 8);
+                    let data = [
+                        flags,
+                        target_x as u32,
+                        target_y as u32,
+                        win_width as u32,
+                        win_height as u32,
+                    ];
+                    let event = x11rb::protocol::xproto::ClientMessageEvent {
+                        response_type: x11rb::protocol::xproto::CLIENT_MESSAGE_EVENT,
+                        format: 32,
+                        sequence: 0,
+                        window: xid,
+                        type_: atom.atom,
+                        data: x11rb::protocol::xproto::ClientMessageData::from(data),
+                    };
+                    let _ = conn.send_event(
+                        false,
+                        screen.root,
+                        x11rb::protocol::xproto::EventMask::SUBSTRUCTURE_REDIRECT
+                            | x11rb::protocol::xproto::EventMask::SUBSTRUCTURE_NOTIFY,
+                        event,
+                    );
+                }
+            }
+            let _ = conn.flush();
+        }
+
+        // Fast wmctrl with Gravity 1 (NorthWest / exact top-left)
         let hex_id = format!("0x{:08x}", xid);
         let _ = std::process::Command::new("wmctrl")
             .args([
@@ -77,7 +163,7 @@ pub fn position_window_by_id(xid: u32, win_width: i32, win_height: i32) {
                 "-r",
                 &hex_id,
                 "-e",
-                &format!("0,{},{},{},{}", target_x, target_y, win_width, win_height),
+                &format!("1,{},{},{},{}", target_x, target_y, win_width, win_height),
             ])
             .status();
     }
@@ -91,7 +177,7 @@ pub fn position_window_by_title(win_width: i32, win_height: i32) {
                 "-r",
                 "Clipboard",
                 "-e",
-                &format!("0,{},{},{},{}", target_x, target_y, win_width, win_height),
+                &format!("1,{},{},{},{}", target_x, target_y, win_width, win_height),
             ])
             .status();
     }
