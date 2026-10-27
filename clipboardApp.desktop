@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Clipboard Manager
+Exec=/home/mob-and-04/.local/bin/clipboardApp --daemon
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
+Comment=Privacy-first low-RAM clipboard manager
+Categories=Utility;

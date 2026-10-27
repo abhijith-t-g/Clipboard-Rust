@@ -149,6 +149,44 @@ thread_local! {
     static WINDOW_XID: RefCell<Option<u32>> = const { RefCell::new(None) };
 }
 
+pub fn init_daemon(app: &Application, history: Arc<Mutex<ClipboardHistory>>) {
+    // 1. Hold application guard so it runs as a background daemon
+    APP_HOLD_GUARD.with(|guard| {
+        if guard.borrow().is_none() {
+            *guard.borrow_mut() = Some(app.hold());
+        }
+    });
+
+    // 2. Install Windows 11 Dark CSS
+    if let Some(display) = gdk::Display::default() {
+        let provider = CssProvider::new();
+        provider.load_from_data(CSS);
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+
+        // 3. Setup Clipboard Listener Daemon
+        let clipboard = display.clipboard();
+        let history_listener = history.clone();
+        clipboard.connect_changed(move |clip| {
+            let hist = history_listener.clone();
+            clip.read_text_async(None::<&gio::Cancellable>, move |res| {
+                if let Ok(Some(text)) = res {
+                    let text = text.to_string();
+                    if hist.lock().unwrap().add(text) {
+                        if let Some(list_box) = LIST_BOX_REF.with(|l| l.borrow().clone()) {
+                            populate_list(&list_box, &hist.lock().unwrap());
+                            update_badge(&hist.lock().unwrap());
+                        }
+                    }
+                }
+            });
+        });
+    }
+}
+
 pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>>) {
     // Record target window before clipboard window claims focus
     if let Some(prev_active) = crate::x11_helper::get_active_window() {
@@ -179,39 +217,7 @@ pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>
         return;
     }
 
-    // 1. Hold application guard so it runs as a background daemon
-    APP_HOLD_GUARD.with(|guard| {
-        *guard.borrow_mut() = Some(app.hold());
-    });
-
-    // 2. Install Windows 11 Dark CSS (solid, crisp background)
-    if let Some(display) = gdk::Display::default() {
-        let provider = CssProvider::new();
-        provider.load_from_data(CSS);
-        gtk4::style_context_add_provider_for_display(
-            &display,
-            &provider,
-            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
-
-        // 3. Setup Clipboard Listener Daemon:
-        let clipboard = display.clipboard();
-        let history_listener = history.clone();
-        clipboard.connect_changed(move |clip| {
-            let hist = history_listener.clone();
-            clip.read_text_async(None::<&gio::Cancellable>, move |res| {
-                if let Ok(Some(text)) = res {
-                    let text = text.to_string();
-                    if hist.lock().unwrap().add(text) {
-                        if let Some(list_box) = LIST_BOX_REF.with(|l| l.borrow().clone()) {
-                            populate_list(&list_box, &hist.lock().unwrap());
-                            update_badge(&hist.lock().unwrap());
-                        }
-                    }
-                }
-            });
-        });
-    }
+    init_daemon(app, history.clone());
 
     // Main layout
     let vbox = GtkBox::new(Orientation::Vertical, 0);
