@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use gdk4_x11::X11Surface;
 use gtk4::gdk;
 use gtk4::gio;
 use gtk4::glib;
@@ -12,18 +13,17 @@ use gtk4::{
 
 use crate::history::ClipboardHistory;
 
-// Windows 11 Fluent Dark styling
+// Windows 11 Fluent Dark styling with solid background (no X11 transparency artifacts)
 const CSS: &str = r#"
 window {
-    background-color: transparent;
+    background-color: #202020;
+    color: #ffffff;
 }
 
 .win-container {
-    background-color: #202020;
-    border-radius: 12px;
-    border: 1px solid #383838;
+    background-color: #202020;    background-color: #202020;
+
     padding: 10px 12px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
 }
 
 .win-header {
@@ -69,7 +69,7 @@ window {
 }
 
 .history-list {
-    background-color: transparent;
+    background-color: #202020;
 }
 
 .history-row {
@@ -124,14 +124,16 @@ thread_local! {
     static COUNT_BADGE_REF: RefCell<Option<Button>> = const { RefCell::new(None) };
     static APP_HOLD_GUARD: RefCell<Option<gio::ApplicationHoldGuard>> = const { RefCell::new(None) };
     static TARGET_WINDOW_ID: RefCell<Option<u32>> = const { RefCell::new(None) };
+    static WINDOW_XID: RefCell<Option<u32>> = const { RefCell::new(None) };
 }
 
 pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>>) {
-    // Save target window before our window takes focus
-    let prev_active = crate::x11_helper::get_active_window();
-    TARGET_WINDOW_ID.with(|t| *t.borrow_mut() = prev_active);
+    // Record target window before clipboard window claims focus
+    if let Some(prev_active) = crate::x11_helper::get_active_window() {
+        TARGET_WINDOW_ID.with(|t| *t.borrow_mut() = Some(prev_active));
+    }
 
-    // If window already exists, refresh it and bring to front
+    // If window already exists, refresh content and position before presenting
     if let Some(window) = OVERLAY_WINDOW.with(|w| w.borrow().clone()) {
         if let Some(list_box) = LIST_BOX_REF.with(|l| l.borrow().clone()) {
             populate_list(&list_box, &history.lock().unwrap());
@@ -141,20 +143,33 @@ pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>
             search.grab_focus();
         }
         update_badge(&history.lock().unwrap());
+
+        // Reposition window at cursor before presenting
+        let xid = WINDOW_XID.with(|x| *x.borrow());
+        if let Some(xid) = xid {
+            crate::x11_helper::position_window_by_id(xid, 330, 420);
+        } else {
+            crate::x11_helper::position_window_by_title(330, 420);
+        }
+
         window.set_visible(true);
         window.present();
-        glib::timeout_add_local_once(std::time::Duration::from_millis(30), || {
-            crate::x11_helper::position_window_at_cursor(330, 420);
+
+        // Enforce position once more right after map
+        glib::timeout_add_local_once(std::time::Duration::from_millis(20), move || {
+            if let Some(xid) = xid {
+                crate::x11_helper::position_window_by_id(xid, 330, 420);
+            }
         });
         return;
     }
 
-    // 1. Hold application guard so it runs as a background daemon even when window is hidden
+    // 1. Hold application guard so it runs as a background daemon
     APP_HOLD_GUARD.with(|guard| {
         *guard.borrow_mut() = Some(app.hold());
     });
 
-    // 2. Install Windows 11 Dark CSS
+    // 2. Install Windows 11 Dark CSS (solid, crisp background)
     if let Some(display) = gdk::Display::default() {
         let provider = CssProvider::new();
         provider.load_from_data(CSS);
@@ -164,8 +179,7 @@ pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
 
-        // 3. Setup Clipboard Listener Daemon (Phase 2):
-        // Automatically capture whatever the user copies anywhere on system
+        // 3. Setup Clipboard Listener Daemon:
         let clipboard = display.clipboard();
         let history_listener = history.clone();
         clipboard.connect_changed(move |clip| {
@@ -174,7 +188,6 @@ pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>
                 if let Ok(Some(text)) = res {
                     let text = text.to_string();
                     if hist.lock().unwrap().add(text) {
-                        // Refresh UI if visible
                         if let Some(list_box) = LIST_BOX_REF.with(|l| l.borrow().clone()) {
                             populate_list(&list_box, &hist.lock().unwrap());
                             update_badge(&hist.lock().unwrap());
@@ -253,6 +266,14 @@ pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>
         .child(&vbox)
         .build();
 
+    // Realize window so X11 surface is created
+    WidgetExt::realize(&window);
+    let xid = window
+        .surface()
+        .and_then(|s| s.downcast::<X11Surface>().ok())
+        .map(|s| s.xid() as u32);
+    WINDOW_XID.with(|x| *x.borrow_mut() = xid);
+
     // Auto-dismiss when user clicks outside (Focus-out / Blur)
     let window_focus = window.clone();
     window.connect_is_active_notify(move |win| {
@@ -294,13 +315,14 @@ pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>
         list_box_filter.invalidate_filter();
     });
 
-    // Activate item: Copy & Hide
+    // Activate item: Copy & Paste into target application
     let window_activate = window.clone();
     let history_activate = history.clone();
     let activate_selected = move |row: &ListBoxRow| {
         if let Some(content) = get_row_content(row) {
             if let Some(display) = gdk::Display::default() {
                 display.clipboard().set_text(&content);
+                display.primary_clipboard().set_text(&content);
             }
             history_activate.lock().unwrap().add(content);
             window_activate.set_visible(false);
@@ -359,10 +381,22 @@ pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>
     COUNT_BADGE_REF.with(|b| *b.borrow_mut() = Some(clear_btn));
 
     search_entry.grab_focus();
+
+    // Position window at cursor coordinates
+    if let Some(xid) = xid {
+        crate::x11_helper::position_window_by_id(xid, 330, 420);
+    } else {
+        crate::x11_helper::position_window_by_title(330, 420);
+    }
+
     window.set_visible(true);
     window.present();
-    glib::timeout_add_local_once(std::time::Duration::from_millis(50), || {
-        crate::x11_helper::position_window_at_cursor(330, 420);
+
+    // Final position check right after map
+    glib::timeout_add_local_once(std::time::Duration::from_millis(20), move || {
+        if let Some(xid) = xid {
+            crate::x11_helper::position_window_by_id(xid, 330, 420);
+        }
     });
 }
 
