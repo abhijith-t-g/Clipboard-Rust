@@ -93,6 +93,7 @@ impl ClipboardHistory {
         &self.items
     }
 
+    #[allow(dead_code)]
     pub fn get(&self, index: usize) -> Option<&ClipboardItem> {
         self.items.get(index)
     }

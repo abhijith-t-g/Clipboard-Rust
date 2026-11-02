@@ -18,12 +18,19 @@ const CSS: &str = r#"
 window {
     background-color: #202020;
     color: #ffffff;
+    min-width: 330px;
+    max-width: 330px;
+    min-height: 420px;
+    max-height: 420px;
 }
 
 .win-container {
-    background-color: #202020;    background-color: #202020;
-
+    background-color: #202020;
     padding: 10px 12px;
+    min-width: 330px;
+    max-width: 330px;
+    min-height: 420px;
+    max-height: 420px;
 }
 
 .win-header {
@@ -70,6 +77,8 @@ window {
 
 .history-list {
     background-color: #202020;
+    min-width: 300px;
+    max-width: 306px;
 }
 
 .history-row {
@@ -79,6 +88,7 @@ window {
     padding: 7px 10px;
     border: 1px solid transparent;
     transition: background-color 100ms ease;
+    max-width: 306px;
 }
 
 .history-row:hover {
@@ -222,6 +232,7 @@ pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>
     // Main layout
     let vbox = GtkBox::new(Orientation::Vertical, 0);
     vbox.add_css_class("win-container");
+    vbox.set_size_request(330, 420);
 
     // Header bar (Title + "Clear all" button)
     let header_box = GtkBox::new(Orientation::Horizontal, 6);
@@ -260,6 +271,10 @@ pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>
     let scrolled_window = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
+        .propagate_natural_width(false)
+        .propagate_natural_height(false)
+        .max_content_width(330)
+        .max_content_height(340)
         .vexpand(true)
         .child(&list_box)
         .build();
@@ -283,6 +298,7 @@ pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>
         .title("Clipboard")
         .default_width(330)
         .default_height(420)
+        .resizable(false)
         .decorated(false)
         .child(&vbox)
         .build();
@@ -478,18 +494,33 @@ fn populate_list(list_box: &ListBox, history: &ClipboardHistory) {
 
         let row_box = GtkBox::new(Orientation::Vertical, 2);
 
-        // Preview snippet (max 3 lines)
-        let lines: Vec<&str> = item.content.lines().take(3).collect();
-        let preview = lines.join("\n");
+        // Preview snippet (max 3 lines, capped at 60 chars per line to prevent horizontal expansion)
+        let mut preview_lines = Vec::new();
+        for line in item.content.lines().take(3) {
+            let trimmed = line.trim();
+            if trimmed.chars().count() > 60 {
+                let truncated: String = trimmed.chars().take(60).collect();
+                preview_lines.push(format!("{}…", truncated));
+            } else {
+                preview_lines.push(trimmed.to_string());
+            }
+        }
+        let preview = if preview_lines.is_empty() {
+            String::new()
+        } else {
+            preview_lines.join("\n")
+        };
 
         let content_label = Label::builder()
             .label(&preview)
             .css_classes(["item-content"])
             .xalign(0.0)
-            .hexpand(true)
+            .hexpand(false)
             .ellipsize(gtk4::pango::EllipsizeMode::End)
-            .max_width_chars(35)
+            .width_chars(32)
+            .max_width_chars(32)
             .wrap(true)
+            .wrap_mode(gtk4::pango::WrapMode::Char)
             .lines(3)
             .build();
         row_box.append(&content_label);

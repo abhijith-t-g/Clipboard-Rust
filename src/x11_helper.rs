@@ -68,21 +68,26 @@ pub fn compute_cursor_position(win_width: i32, win_height: i32) -> Option<(i32, 
     Some((target_x, target_y))
 }
 
-/// Sets ICCCM WM_NORMAL_HINTS with USPosition flag so the window manager
-/// places the window at (x, y) immediately on map, without defaulting to (0, 0)
+/// Sets ICCCM WM_NORMAL_HINTS with USPosition and Min/Max size flags so the window manager
+/// places the window at (x, y) immediately on map, and strictly bounds its size to (w, h).
 pub fn set_wm_normal_hints_position(xid: u32, x: i32, y: i32, w: i32, h: i32) {
     let Ok((conn, _)) = x11rb::connect(None) else {
         return;
     };
-    // USPosition (1 << 0) | PPosition (1 << 2) | USSize (1 << 1) | PSize (1 << 3)
-    let flags: u32 = (1 << 0) | (1 << 2) | (1 << 1) | (1 << 3);
+    // USPosition (1 << 0) | USSize (1 << 1) | PPosition (1 << 2) | PSize (1 << 3)
+    // PMinSize (1 << 4) | PMaxSize (1 << 5)
+    let flags: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5);
     let hints: [u32; 18] = [
         flags,
         x as u32,
         y as u32,
         w as u32,
         h as u32,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        w as u32, // min_width
+        h as u32, // min_height
+        w as u32, // max_width
+        h as u32, // max_height
+        0, 0, 0, 0, 0, 0, 0, 0, 0,
     ];
     let _ = conn.change_property32(
         x11rb::protocol::xproto::PropMode::REPLACE,
@@ -183,7 +188,77 @@ pub fn position_window_by_title(win_width: i32, win_height: i32) {
     }
 }
 
-/// Refocuses the target window and simulates Ctrl+V to paste the copied content
+/// Checks if a window belongs to a terminal emulator by inspecting WM_CLASS and WM_NAME
+pub fn is_terminal_window(conn: &impl Connection, win: u32) -> bool {
+    let mut check_ids = vec![win];
+
+    // Also check parent window in case client is inside a window manager frame
+    if let Ok(tree) = conn.query_tree(win) {
+        if let Ok(reply) = tree.reply() {
+            if reply.parent != 0 {
+                check_ids.push(reply.parent);
+            }
+        }
+    }
+
+    let terminal_keywords = [
+        "terminal",
+        "alacritty",
+        "kitty",
+        "konsole",
+        "xterm",
+        "urxvt",
+        "tilix",
+        "terminator",
+        "wezterm",
+        "foot",
+        "guake",
+        "tilda",
+        "hyper",
+        "rxvt",
+        "x-terminal-emulator",
+    ];
+
+    for id in check_ids {
+        // 1. Check WM_CLASS
+        if let Ok(prop) = conn.get_property(
+            false,
+            id,
+            AtomEnum::WM_CLASS,
+            AtomEnum::STRING,
+            0,
+            256,
+        ) {
+            if let Ok(reply) = prop.reply() {
+                let class_str = String::from_utf8_lossy(&reply.value).to_lowercase();
+                if terminal_keywords.iter().any(|&kw| class_str.contains(kw)) {
+                    return true;
+                }
+            }
+        }
+
+        // 2. Check WM_NAME
+        if let Ok(prop) = conn.get_property(
+            false,
+            id,
+            AtomEnum::WM_NAME,
+            AtomEnum::STRING,
+            0,
+            256,
+        ) {
+            if let Ok(reply) = prop.reply() {
+                let name_str = String::from_utf8_lossy(&reply.value).to_lowercase();
+                if terminal_keywords.iter().any(|&kw| name_str.contains(kw)) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Refocuses the target window and simulates Ctrl+V (or Ctrl+Shift+V for terminals) to paste
 pub fn paste_into_window(target_window_id: Option<u32>) {
     std::thread::spawn(move || {
         // 1. Refocus target application if an external window was active
@@ -200,6 +275,15 @@ pub fn paste_into_window(target_window_id: Option<u32>) {
         let Ok((conn, _)) = x11rb::connect(None) else {
             return;
         };
+
+        // Determine if target window is a terminal emulator requiring Ctrl+Shift+V
+        let win_to_check = target_window_id.or_else(get_active_window);
+        let is_terminal = if let Some(wid) = win_to_check {
+            is_terminal_window(&conn, wid)
+        } else {
+            false
+        };
+
         let setup = conn.setup();
         let min_keycode = setup.min_keycode;
         let max_keycode = setup.max_keycode;
@@ -214,6 +298,7 @@ pub fn paste_into_window(target_window_id: Option<u32>) {
         let keysyms_per_keycode = mapping_reply.keysyms_per_keycode as usize;
 
         let mut ctrl_code = 37u8;
+        let mut shift_code = 50u8;
         let mut v_code = 55u8;
         let mut super_keys = Vec::new();
         let mut alt_keys = Vec::new();
@@ -222,7 +307,8 @@ pub fn paste_into_window(target_window_id: Option<u32>) {
             let keycode = min_keycode + idx as u8;
             for &sym in chunk {
                 match sym {
-                    0xffe3 => ctrl_code = keycode,                // XK_Control_L
+                    0xffe3 | 0xffe4 => ctrl_code = keycode,       // XK_Control_L / XK_Control_R
+                    0xffe1 | 0xffe2 => shift_code = keycode,      // XK_Shift_L / XK_Shift_R
                     0x0076 | 0x0056 => v_code = keycode,         // XK_v / XK_V
                     0xffeb | 0xffec => super_keys.push(keycode), // XK_Super_L / XK_Super_R
                     0xffe9 | 0xffea => alt_keys.push(keycode),   // XK_Alt_L / XK_Alt_R
@@ -241,20 +327,37 @@ pub fn paste_into_window(target_window_id: Option<u32>) {
         let _ = conn.flush();
         std::thread::sleep(std::time::Duration::from_millis(30));
 
-        // Send KeyPress Ctrl
-        let _ = conn.xtest_fake_input(2, ctrl_code, 0, 0, 0, 0, 0);
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        if is_terminal {
+            // Terminals require Ctrl + Shift + V to paste
+            let _ = conn.xtest_fake_input(2, ctrl_code, 0, 0, 0, 0, 0); // KeyPress Ctrl
+            std::thread::sleep(std::time::Duration::from_millis(15));
 
-        // Send KeyPress V
-        let _ = conn.xtest_fake_input(2, v_code, 0, 0, 0, 0, 0);
-        std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = conn.xtest_fake_input(2, shift_code, 0, 0, 0, 0, 0); // KeyPress Shift
+            std::thread::sleep(std::time::Duration::from_millis(15));
 
-        // Send KeyRelease V
-        let _ = conn.xtest_fake_input(3, v_code, 0, 0, 0, 0, 0);
-        std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = conn.xtest_fake_input(2, v_code, 0, 0, 0, 0, 0); // KeyPress V
+            std::thread::sleep(std::time::Duration::from_millis(20));
 
-        // Send KeyRelease Ctrl
-        let _ = conn.xtest_fake_input(3, ctrl_code, 0, 0, 0, 0, 0);
+            let _ = conn.xtest_fake_input(3, v_code, 0, 0, 0, 0, 0); // KeyRelease V
+            std::thread::sleep(std::time::Duration::from_millis(15));
+
+            let _ = conn.xtest_fake_input(3, shift_code, 0, 0, 0, 0, 0); // KeyRelease Shift
+            std::thread::sleep(std::time::Duration::from_millis(15));
+
+            let _ = conn.xtest_fake_input(3, ctrl_code, 0, 0, 0, 0, 0); // KeyRelease Ctrl
+        } else {
+            // Standard GUI apps: Ctrl + V
+            let _ = conn.xtest_fake_input(2, ctrl_code, 0, 0, 0, 0, 0); // KeyPress Ctrl
+            std::thread::sleep(std::time::Duration::from_millis(20));
+
+            let _ = conn.xtest_fake_input(2, v_code, 0, 0, 0, 0, 0); // KeyPress V
+            std::thread::sleep(std::time::Duration::from_millis(20));
+
+            let _ = conn.xtest_fake_input(3, v_code, 0, 0, 0, 0, 0); // KeyRelease V
+            std::thread::sleep(std::time::Duration::from_millis(20));
+
+            let _ = conn.xtest_fake_input(3, ctrl_code, 0, 0, 0, 0, 0); // KeyRelease Ctrl
+        }
 
         let _ = conn.flush();
         // Give X server time to deliver events before connection closes
@@ -282,5 +385,54 @@ mod tests {
         println!("fake input check: res1={:?}, res2={:?}", res1, res2);
         assert!(res1.is_ok());
         assert!(res2.is_ok());
+    }
+
+    #[test]
+    fn test_is_terminal_detection() {
+        let (conn, screen_num) = x11rb::connect(None).unwrap();
+        let screen = &conn.setup().roots[screen_num];
+        let win = conn.generate_id().unwrap();
+        conn.create_window(
+            x11rb::COPY_FROM_PARENT as u8,
+            win,
+            screen.root,
+            0,
+            0,
+            100,
+            100,
+            0,
+            x11rb::protocol::xproto::WindowClass::INPUT_OUTPUT,
+            screen.root_visual,
+            &x11rb::protocol::xproto::CreateWindowAux::new(),
+        )
+        .unwrap();
+
+        // Initially without WM_CLASS -> false
+        assert!(!is_terminal_window(&conn, win));
+
+        // Set WM_CLASS to "gnome-terminal-server\0Gnome-terminal\0"
+        conn.change_property8(
+            x11rb::protocol::xproto::PropMode::REPLACE,
+            win,
+            AtomEnum::WM_CLASS,
+            AtomEnum::STRING,
+            b"gnome-terminal-server\0Gnome-terminal\0",
+        )
+        .unwrap();
+        assert!(is_terminal_window(&conn, win));
+
+        // Set WM_CLASS to "firefox\0Navigator\0" -> false
+        conn.change_property8(
+            x11rb::protocol::xproto::PropMode::REPLACE,
+            win,
+            AtomEnum::WM_CLASS,
+            AtomEnum::STRING,
+            b"firefox\0Navigator\0",
+        )
+        .unwrap();
+        assert!(!is_terminal_window(&conn, win));
+
+        // Cleanup
+        let _ = conn.destroy_window(win);
     }
 }
