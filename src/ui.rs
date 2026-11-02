@@ -11,7 +11,7 @@ use gtk4::{
     Label, ListBox, ListBoxRow, Orientation, PolicyType, ScrolledWindow, SearchEntry,
 };
 
-use crate::history::ClipboardHistory;
+use crate::history::{ClipboardContent, ClipboardHistory};
 
 // Windows 11 Fluent Dark styling with solid background (no X11 transparency artifacts)
 const CSS: &str = r#"
@@ -108,6 +108,12 @@ window {
     line-height: 1.3;
 }
 
+.item-picture {
+    border-radius: 4px;
+    background-color: #1a1a1a;
+    margin-bottom: 4px;
+}
+
 .item-meta {
     color: #888888;
     font-size: 10px;
@@ -182,20 +188,46 @@ pub fn init_daemon(app: &Application, history: Arc<Mutex<ClipboardHistory>>) {
         let history_listener = history.clone();
         clipboard.connect_changed(move |clip| {
             let hist = history_listener.clone();
-            clip.read_text_async(None::<&gio::Cancellable>, move |res| {
-                if let Ok(Some(text)) = res {
-                    let text = text.to_string();
-                    if hist.lock().unwrap().add(text) {
-                        if let Some(list_box) = LIST_BOX_REF.with(|l| l.borrow().clone()) {
-                            populate_list(&list_box, &hist.lock().unwrap());
-                            update_badge(&hist.lock().unwrap());
+            let clip_clone = clip.clone();
+
+            clip.read_texture_async(None::<&gio::Cancellable>, move |res| {
+                match res {
+                    Ok(Some(texture)) => {
+                        use gdk::prelude::TextureExt;
+                        let width = texture.width();
+                        let height = texture.height();
+                        let bytes = texture.save_to_png_bytes();
+                        if hist.lock().unwrap().add_image(bytes, width, height) {
+                            if let Some(list_box) = LIST_BOX_REF.with(|l| l.borrow().clone()) {
+                                populate_list(&list_box, &hist.lock().unwrap());
+                                update_badge(&hist.lock().unwrap());
+                            }
                         }
+                    }
+                    _ => {
+                        // Not an image, fallback to reading as text
+                        read_text_fallback(&clip_clone, hist);
                     }
                 }
             });
         });
     }
 }
+
+fn read_text_fallback(clip: &gdk::Clipboard, hist: Arc<Mutex<ClipboardHistory>>) {
+    clip.read_text_async(None::<&gio::Cancellable>, move |res| {
+        if let Ok(Some(text)) = res {
+            let text = text.to_string();
+            if hist.lock().unwrap().add_text(text) {
+                if let Some(list_box) = LIST_BOX_REF.with(|l| l.borrow().clone()) {
+                    populate_list(&list_box, &hist.lock().unwrap());
+                    update_badge(&hist.lock().unwrap());
+                }
+            }
+        }
+    });
+}
+
 
 pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>>) {
     // Record target window before clipboard window claims focus
@@ -342,7 +374,7 @@ pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>
         if query.is_empty() {
             return true;
         }
-        if let Some(content) = get_row_content(row) {
+        if let Some(content) = get_row_search_text(row) {
             content.to_lowercase().contains(&query)
         } else {
             true
@@ -359,18 +391,41 @@ pub fn show_or_create_ui(app: &Application, history: Arc<Mutex<ClipboardHistory>
     let window_activate = window.clone();
     let history_activate = history.clone();
     let activate_selected = move |row: &ListBoxRow| {
-        if let Some(content) = get_row_content(row) {
-            if let Some(display) = gdk::Display::default() {
-                display.clipboard().set_text(&content);
-                display.primary_clipboard().set_text(&content);
+        let idx = row.index();
+        if idx >= 0 {
+            let item_opt = history_activate.lock().unwrap().get(idx as usize).cloned();
+            if let Some(item) = item_opt {
+                if let Some(display) = gdk::Display::default() {
+                    match &item.content {
+                        ClipboardContent::Text(text) => {
+                            display.clipboard().set_text(text);
+                            display.primary_clipboard().set_text(text);
+                        }
+                        ClipboardContent::Image { bytes, .. } => {
+                            if let Ok(texture) = gdk::Texture::from_bytes(bytes) {
+                                display.clipboard().set_texture(&texture);
+                            }
+                        }
+                    }
+                }
+
+                // Promote to front in history
+                match item.content {
+                    ClipboardContent::Text(text) => {
+                        history_activate.lock().unwrap().add_text(text);
+                    }
+                    ClipboardContent::Image { bytes, width, height, .. } => {
+                        history_activate.lock().unwrap().add_image(bytes, width, height);
+                    }
+                }
+
+                if let Some(xid) = WINDOW_XID.with(|x| *x.borrow()) {
+                    crate::x11_helper::move_offscreen(xid);
+                }
+                window_activate.set_visible(false);
+                let target_win = TARGET_WINDOW_ID.with(|t| *t.borrow());
+                crate::x11_helper::paste_into_window(target_win);
             }
-            history_activate.lock().unwrap().add(content);
-            if let Some(xid) = WINDOW_XID.with(|x| *x.borrow()) {
-                crate::x11_helper::move_offscreen(xid);
-            }
-            window_activate.set_visible(false);
-            let target_win = TARGET_WINDOW_ID.with(|t| *t.borrow());
-            crate::x11_helper::paste_into_window(target_win);
         }
     };
 
@@ -445,6 +500,16 @@ fn update_badge(history: &ClipboardHistory) {
     }
 }
 
+fn format_bytes(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
 fn populate_list(list_box: &ListBox, history: &ClipboardHistory) {
     while let Some(child) = list_box.first_child() {
         list_box.remove(&child);
@@ -476,7 +541,7 @@ fn populate_list(list_box: &ListBox, history: &ClipboardHistory) {
         empty_box.append(&msg_label);
 
         let sub_label = Label::builder()
-            .label("Copy text anywhere to see it here")
+            .label("Copy text or images anywhere to see them here")
             .css_classes(["empty-sub"])
             .halign(gtk4::Align::Center)
             .build();
@@ -494,48 +559,77 @@ fn populate_list(list_box: &ListBox, history: &ClipboardHistory) {
 
         let row_box = GtkBox::new(Orientation::Vertical, 2);
 
-        // Preview snippet (max 3 lines, capped at 60 chars per line to prevent horizontal expansion)
-        let mut preview_lines = Vec::new();
-        for line in item.content.lines().take(3) {
-            let trimmed = line.trim();
-            if trimmed.chars().count() > 60 {
-                let truncated: String = trimmed.chars().take(60).collect();
-                preview_lines.push(format!("{}…", truncated));
-            } else {
-                preview_lines.push(trimmed.to_string());
+        match &item.content {
+            ClipboardContent::Text(text) => {
+                // Preview snippet (max 3 lines, capped at 60 chars per line to prevent horizontal expansion)
+                let mut preview_lines = Vec::new();
+                for line in text.lines().take(3) {
+                    let trimmed = line.trim();
+                    if trimmed.chars().count() > 60 {
+                        let truncated: String = trimmed.chars().take(60).collect();
+                        preview_lines.push(format!("{}…", truncated));
+                    } else {
+                        preview_lines.push(trimmed.to_string());
+                    }
+                }
+                let preview = if preview_lines.is_empty() {
+                    String::new()
+                } else {
+                    preview_lines.join("\n")
+                };
+
+                let content_label = Label::builder()
+                    .label(&preview)
+                    .css_classes(["item-content"])
+                    .xalign(0.0)
+                    .hexpand(false)
+                    .ellipsize(gtk4::pango::EllipsizeMode::End)
+                    .width_chars(32)
+                    .max_width_chars(32)
+                    .wrap(true)
+                    .wrap_mode(gtk4::pango::WrapMode::Char)
+                    .lines(3)
+                    .build();
+                row_box.append(&content_label);
+
+                // Metadata: relative time and character length
+                let meta_text = format!("{} • {} chars", item.relative_time(), text.len());
+                let meta_label = Label::builder()
+                    .label(&meta_text)
+                    .css_classes(["item-meta"])
+                    .xalign(0.0)
+                    .build();
+                row_box.append(&meta_label);
+
+                unsafe {
+                    row.set_data("search-text", text.clone());
+                }
             }
-        }
-        let preview = if preview_lines.is_empty() {
-            String::new()
-        } else {
-            preview_lines.join("\n")
-        };
+            ClipboardContent::Image { bytes, width, height, .. } => {
+                if let Ok(texture) = gdk::Texture::from_bytes(bytes) {
+                    let picture = gtk4::Picture::for_paintable(&texture);
+                    picture.set_can_shrink(true);
+                    picture.set_keep_aspect_ratio(true);
+                    picture.set_height_request(85);
+                    picture.set_halign(gtk4::Align::Center);
+                    picture.add_css_class("item-picture");
+                    row_box.append(&picture);
+                }
 
-        let content_label = Label::builder()
-            .label(&preview)
-            .css_classes(["item-content"])
-            .xalign(0.0)
-            .hexpand(false)
-            .ellipsize(gtk4::pango::EllipsizeMode::End)
-            .width_chars(32)
-            .max_width_chars(32)
-            .wrap(true)
-            .wrap_mode(gtk4::pango::WrapMode::Char)
-            .lines(3)
-            .build();
-        row_box.append(&content_label);
+                let size_str = format_bytes(bytes.len());
+                let meta_text = format!("🖼 {} × {} • {} • {}", width, height, size_str, item.relative_time());
+                let meta_label = Label::builder()
+                    .label(&meta_text)
+                    .css_classes(["item-meta"])
+                    .xalign(0.0)
+                    .build();
+                row_box.append(&meta_label);
 
-        // Metadata: relative time and character length
-        let meta_text = format!("{} • {} chars", item.relative_time(), item.content.len());
-        let meta_label = Label::builder()
-            .label(&meta_text)
-            .css_classes(["item-meta"])
-            .xalign(0.0)
-            .build();
-        row_box.append(&meta_label);
-
-        unsafe {
-            row.set_data("clipboard-content", item.content.clone());
+                let search_text = format!("image screenshot img {}x{} {} x {}", width, height, width, height);
+                unsafe {
+                    row.set_data("search-text", search_text);
+                }
+            }
         }
 
         row.set_child(Some(&row_box));
@@ -547,6 +641,7 @@ fn populate_list(list_box: &ListBox, history: &ClipboardHistory) {
     }
 }
 
-fn get_row_content(row: &ListBoxRow) -> Option<String> {
-    unsafe { row.data::<String>("clipboard-content").map(|s| s.as_ref().clone()) }
+fn get_row_search_text(row: &ListBoxRow) -> Option<String> {
+    unsafe { row.data::<String>("search-text").map(|s| s.as_ref().clone()) }
 }
+
